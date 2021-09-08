@@ -18,7 +18,7 @@ defmodule CallcontTest do
     res = a + 1
   end
 
-  def test() do
+  test "poc" do
     IO.inspect(__MODULE__.somefunc(1))
 
     u = CallCont.runIO(__MODULE__.somefunc(1), nil)
