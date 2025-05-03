@@ -7,7 +7,11 @@ defmodule Callcont.MixProject do
       version: "0.1.0",
       elixir: "~> 1.12",
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      description: description(),
+      package: package(),
+      name: "callcont",
+      source_url: "https://github.com/xenomorphtech/callcont"
     ]
   end
 
@@ -15,6 +19,20 @@ defmodule Callcont.MixProject do
   def application do
     [
       extra_applications: [:logger]
+    ]
+  end
+
+  defp description() do
+    "simple call continuations on elixir"
+  end
+
+  defp package() do
+    [
+      # Only needed if different from OTP application name
+      name: "callcont",
+      files: ~w(lib priv .formatter.exs mix.exs README* LICENSE* CHANGELOG*),
+      licenses: ["MIT"],
+      links: %{"GitHub" => "https://github.com/xenomorphtech/callcont"}
     ]
   end
 
