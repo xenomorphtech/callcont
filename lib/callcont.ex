@@ -1,313 +1,208 @@
 defmodule CallCont do
-  def lift(s) do
-    s
-  end
+  @moduledoc false
 
-  defmacro make_cc(module, function, args) do
+  ## ────────────────────────────────────────────────────────────────────
+  ## Public helpers
+  ## ────────────────────────────────────────────────────────────────────
+  def lift(x), do: x
+
+  defmacro make_cc(mod, fun, args) do
     quote do
-      make_cc_args = unquote(args)
-      Macro.escape({:call, unquote(module), unquote(function), make_cc_args})
+      Macro.escape({:call, unquote(mod), unquote(fun), unquote(args)})
     end
   end
 
-  defmacro def_io(what, what2) do
-    IO.inspect(what)
-    {name, location, args} = what
-    IO.inspect(what2)
+  ## ────────────────────────────────────────────────────────────────────
+  ## __using__
+  ## ────────────────────────────────────────────────────────────────────
+  defmacro __using__(_opts) do
+    quote do
+      import CallCont
+      require CallCont
 
-    # find any do
-    [
-      do: exprs
-    ] = what2
-
-    case exprs do
-      {:__block__, _, _} ->
-        blocks = IO.inspect(split_block_0(exprs, [], []))
-        def_io_1(blocks, {name, location, args}, __CALLER__)
-
-      _ ->
-        {:def, [context: CallCont, import: Kernel],
-         [
-           {name, location, args},
-           [do: exprs]
-           # [line: 69], [{:a, [line: 69], nil}]
-         ]}
+      @dialyzer {:nowarn_function, runIO: 1}
+      @dialyzer {:nowarn_function, runIO: 2}
     end
   end
 
-  defp def_io_1(blocks, {name, location, args}, caller) do
-    context = %{
-      vars: vars2(args, %{}),
+  ## ────────────────────────────────────────────────────────────────────
+  ## def_io
+  ## ────────────────────────────────────────────────────────────────────
+
+  # one macro covers both the “<-” and pure cases
+  defmacro def_io({name, loc, args} = _head, do: body) do
+    if contains_bind?(body) do
+      # impure / continuation-style
+      blocks = split_blocks(body)
+      fun_asts = build_functions(blocks, name, loc, args, __CALLER__)
+
+      quote do
+        (unquote_splicing(fun_asts))
+      end
+    else
+      # pure – emit a normal def
+      quote do
+        def unquote(name)(unquote_splicing(args)), do: unquote(body)
+      end
+    end
+  end
+
+  ## ────────────────────────────────────────────────────────────────────
+  ## runIO interpreter helpers
+  ## ────────────────────────────────────────────────────────────────────
+  defmacro runIO_pre do
+    quote do
+      def runIO(expr), do: runIO([], expr)
+
+      def runIO(stack, {:call, m, f, p}),
+        do: runIO([{:call, m, f, p} | stack], nil)
+
+      def runIO(stack, [{:call, m, f, p}, {:continue, cm, cf, cp}]),
+        do: runIO([{:call, m, f, p}, {:continue, cm, cf, cp} | stack], nil)
+
+      def runIO([], res), do: res
+    end
+  end
+
+  defmacro runIO_pos do
+    quote do
+      def runIO([frame | rest], res) do
+        case frame do
+          {:call, CallCont, :lift, [v]} -> runIO(rest, v)
+          {:call, m, f, a} -> runIO(rest, apply(m, f, a))
+          {:continue, m, f, a} -> runIO(rest, apply(m, f, [res | a]))
+        end
+      end
+    end
+  end
+
+  ## ────────────────────────────────────────────────────────────────────
+  ##  Implementation (private)
+  ## ────────────────────────────────────────────────────────────────────
+
+  # ------- block splitter -------------------------------------------------
+  defp split_blocks({:__block__, _, exprs}), do: do_split(exprs, [], [])
+  defp split_blocks(expr), do: do_split([expr], [], [])
+
+  defp do_split([], acc_exprs, acc_blocks),
+    do: Enum.reverse([{nil, Enum.reverse(acc_exprs)} | acc_blocks])
+
+  defp do_split([{:<-, _, _} = bind | rest], acc_exprs, acc_blocks) do
+    do_split(rest, [], [{bind, Enum.reverse(acc_exprs)} | acc_blocks])
+  end
+
+  defp do_split([e | rest], acc_exprs, acc_blocks),
+    do: do_split(rest, [e | acc_exprs], acc_blocks)
+
+  # ------- function builder ----------------------------------------------
+  defp build_functions(blocks, fname, loc, args, caller) do
+    ctx0 = %{
+      vars: varmap(args),
       args: args,
-      fname: name,
-      flocation: location,
-      newfuns: [],
-      last_bound: nil,
-      module: caller.module
+      name: fname,
+      loc: loc,
+      mod: caller.module,
+      last: nil,
+      out: []
     }
 
-    context =
-      Enum.reduce(Enum.with_index(blocks), context, fn {block, index}, context ->
-        {context, res} = produce_continuation(block, index, context)
-        context = Map.put(context, :newfuns, [res | context.newfuns])
-        context
-      end)
+    final =
+      Enum.with_index(blocks)
+      |> Enum.reduce(ctx0, &produce_fun/2)
 
-    context.newfuns
+    Enum.reverse(final.out)
   end
 
-  def produce_continuation({bentry, b1}, index, context) do
-    #    IO.inspect({:context, context})
+  defp produce_fun({{bind, exprs}, idx}, ctx) do
+    case bind do
+      nil ->
+        body = wrap(exprs)
+        %{ctx | out: [mk_def(idx, body, ctx) | ctx.out]}
 
-    args =
-      if index == 0 do
-        context.args
-      else
-        vars = context.vars |> Map.delete(context.last_bound)
-        res = vars |> Map.keys() |> Enum.map(fn a -> {a, [], nil} end)
-        [{context.last_bound, [], nil} | res]
-      end
+      {:<-, _, [{bound, _, _}, rhs]} ->
+        {mod, fun, params} = normalize_call(rhs, ctx.mod)
 
-    {body, context} =
-      if bentry == nil do
-        {{:__block__, [], b1}, context}
-      else
-        {:<-, _,
-         [
-           {bname, _, nil},
-           {fname, _, params}
-         ]} = bentry
+        env_vars =
+          ctx.vars
+          |> Map.keys()
+          |> Enum.reject(&(&1 == bound))
+          |> Enum.map(&{&1, [], nil})
 
-        {call_module, call_fname} =
-          case fname do
-            name when is_atom(name) ->
-              {context.module, name}
-
-            {:., _which_line, [modulename, fname]} ->
-              modulename =
-                case modulename do
-                  name when is_atom(name) ->
-                    name
-
-                  {:__aliases__, _, modulenames} ->
-                    :"#{Enum.join(["Elixir" | modulenames], ".")}"
-
-                  {atom, _, n} = var when is_atom(atom) and n in [Elixir, nil] ->
-                    var
-                end
-
-              {modulename, fname}
+        call =
+          quote do
+            [
+              {:call, unquote(mod), unquote(fun), unquote(params)},
+              {:continue, unquote(ctx.mod), unquote(cont_name(ctx.name, idx + 1)),
+               unquote(env_vars)}
+            ]
           end
 
-        vars_in_block =
-          if context.last_bound do
-            Map.put(context.vars, context.last_bound, 1)
-          else
-            context.vars
-          end
+        body = wrap(exprs ++ [call])
 
-        vars_in_block = vars(b1, vars_in_block) |> Map.delete(bname)
-        vars_to_pass = vars_in_block |> Map.keys() |> Enum.map(fn a -> {a, [], nil} end)
-
-        IO.inspect({:b1, b1})
-
-        body =
-          {:__block__, [],
-           b1 ++
-             quote do
-               [
-                 [
-                   {:call, unquote(call_module), unquote(call_fname), unquote(params)},
-                   {:continue, unquote(context.module),
-                    unquote(:"#{context.fname}_cont_#{index + 1}"), unquote(vars_to_pass)}
-                 ]
-               ]
-             end}
-
-        IO.inspect(body)
-
-        IO.inspect(vars(b1, %{}))
-
-        vars_in_block =
-          if context.last_bound do
-            Map.put(vars_in_block, context.last_bound, 1)
-          else
-            vars_in_block
-          end
-
-        context = Map.put(context, :vars, vars_in_block)
-        context = Map.put(context, :last_bound, bname)
-
-        {body, context}
-      end
-
-    fun_name =
-      if index != 0 do
-        :"#{context.fname}_cont_#{index}"
-      else
-        :"#{context.fname}"
-      end
-
-    res =
-      {:def, [context: CallCont, import: Kernel],
-       [
-         {fun_name, context.flocation, args},
-         [do: body]
-         # [line: 69], [{:a, [line: 69], nil}]
-       ]}
-
-    IO.inspect(res)
-
-    {context, res}
-  end
-
-  def vars([], acc) do
-    acc
-  end
-
-  def vars([{:=, _, [side_a, _side_b]} | rest], acc) do
-    acc = vars2(side_a, acc)
-    vars(rest, acc)
-  end
-
-  def vars([_ | rest], acc) do
-    vars(rest, acc)
-  end
-
-  def vars2([], acc) do
-    acc
-  end
-
-  def vars2({name, [line: _], nil}, acc) do
-    acc = Map.put(acc, name, 1)
-  end
-
-  def vars2({:=, _, [side_a, side_b]}, acc) do
-    vars2(side_a, vars2(side_b, acc))
-  end
-
-  def vars2({:%{}, _, key_val}, acc) do
-    vals = Enum.map(key_val, fn {a, b} -> b end)
-    IO.inspect({:map_vals, vals})
-    vars2(vals, acc)
-  end
-
-  def vars2([e | rest], acc) do
-    vars2(rest, vars2(e, acc))
-  end
-
-  def vars2(e, acc) when is_tuple(e) do
-    IO.inspect({:discarding_tupple, e})
-
-    elements =
-      Enum.map(1..10, fn i ->
-        try do
-          eleme = :erlang.element(i, e)
-          vars2(eleme, %{}) |> Map.to_list()
-        catch
-          _, _ -> []
-        end
-      end)
-
-    elements = List.flatten(elements)
-    IO.inspect({:elements, elements})
-
-    Enum.reduce(Enum.filter(elements, &(&1 != [])), acc, fn {k, v}, acc ->
-      Map.put(acc, k, v)
-    end)
-  end
-
-  def vars2(e, acc) do
-    IO.inspect({:discarding, e})
-    acc
-  end
-
-  def split_block_0({:__block__, _, exprs}, [], []) do
-    split_block(exprs, [], [])
-  end
-
-  def split_block_0(exprs, [], []) do
-    split_block([exprs], [], [])
-  end
-
-  def split_block([], things, blocks) do
-    :lists.reverse([{nil, :lists.reverse(things)} | blocks])
-  end
-
-  def split_block(
-        [
-          {:<-, _metadata,
-           [
-             _val,
-             _another
-           ]} = entry
-          | rest
-        ],
-        things,
-        blocks
-      ) do
-    # metadata = [line: 24]
-    newblock = {entry, :lists.reverse(things)}
-    split_block(rest, [], [newblock | blocks])
-  end
-
-  def split_block(
-        [entry | rest],
-        things,
-        blocks
-      ) do
-    split_block(rest, [entry | things], blocks)
-  end
-
-  def runIO(res) do
-    runIO([], res)
-  end
-
-  def runIO(
-        callstack,
-        {:call, call_m, call_f, call_p}
-      ) do
-    callstack = [
-      {:call, call_m, call_f, call_p} | callstack
-    ]
-
-    runIO(callstack, nil)
-  end
-
-  def runIO(callstack, [
-        {:call, call_m, call_f, call_p},
-        {:continue, cont_m, cont_f, cont_p}
-      ]) do
-    callstack = [
-      {:call, call_m, call_f, call_p},
-      {:continue, cont_m, cont_f, cont_p} | callstack
-    ]
-
-    runIO(callstack, nil)
-  end
-
-  def runIO([], res) do
-    res
-  end
-
-  def runIO([io | callstack], res) do
-    case io do
-      {:call, module, fname, params} ->
-        IO.inspect({:calling, module, fname, params})
-        res = Kernel.apply(module, fname, params)
-        runIO(callstack, res)
-
-      {:continue, module, fname, params} ->
-        IO.inspect({:calling, module, fname, [res | params]})
-        res = Kernel.apply(module, fname, [res | params])
-        runIO(callstack, res)
-
-      pure_res ->
-        runIO(callstack, pure_res)
+        ctx
+        |> Map.update!(:out, &[mk_def(idx, body, ctx) | &1])
+        |> Map.update!(:vars, &Map.put(&1, bound, true))
+        |> Map.put(:last, bound)
     end
   end
 
-  def lift([io | callstack], res) do
-  end
-end
+  # ------- helpers --------------------------------------------------------
+  defp mk_def(idx, body, ctx) do
+    fun = if idx == 0, do: ctx.name, else: cont_name(ctx.name, idx)
 
+    args =
+      if idx == 0 do
+        ctx.args
+      else
+        env =
+          ctx.vars
+          |> Map.delete(ctx.last)
+          |> Map.keys()
+          |> Enum.map(&{&1, [], nil})
+
+        [{ctx.last, [], nil} | env]
+      end
+
+    quote do
+      def unquote(fun)(unquote_splicing(args)), do: unquote(body)
+    end
+  end
+
+  defp wrap(exprs), do: {:__block__, [], exprs}
+
+  defp cont_name(base, idx), do: :"#{base}_cont_#{idx}"
+
+  # variable harvest
+  defp varmap(list) when is_list(list) do
+    list
+    |> Enum.flat_map(fn arg ->
+      {_, vars} =
+        Macro.prewalk(arg, [], fn
+          {v, _, ctx} = node, acc when is_atom(v) and ctx in [nil, Elixir] ->
+            {node, [v | acc]}
+
+          node, acc ->
+            {node, acc}
+        end)
+
+      vars
+    end)
+    |> Map.new(&{&1, true})
+  end
+
+  # detect a <- anywhere
+  defp contains_bind?({:<-, _, _}), do: true
+  defp contains_bind?({:__block__, _, exprs}), do: Enum.any?(exprs, &contains_bind?/1)
+  defp contains_bind?(list) when is_list(list), do: Enum.any?(list, &contains_bind?/1)
+  defp contains_bind?(_), do: false
+
+  # call normaliser  (local or remote)
+  defp normalize_call({{:., _, [m_ast, f]}, _, params}, _caller),
+    do: {resolve_mod(m_ast), f, params}
+
+  defp normalize_call({f, _, params}, caller), do: {caller, f, params}
+
+  defp resolve_mod({:__aliases__, _, parts}), do: Module.concat(parts)
+  defp resolve_mod(atom) when is_atom(atom), do: atom
+  defp resolve_mod({var, _, _}), do: var
+end
